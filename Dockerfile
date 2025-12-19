@@ -1,83 +1,30 @@
-#!/bin/bash
-set -e
+FROM cloudflare/cloudflared:latest AS cf-source
+FROM dunglas/frankenphp:php8.3
 
-# --- BAGIAN 1: AUTO SETUP LARAVEL ---
+# Copy Cloudflared
+COPY --from=cf-source /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 
-# 1. Cek & Copy .env
-if [ ! -f ".env" ]; then
-    echo "⚠️  File .env tidak ditemukan. Copy dari .env.example..."
-    cp .env.example .env
-fi
+# Install Extensions
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && install-php-extensions pdo_mysql bcmath gd intl zip opcache pcntl
 
-# 2. Setup Database di .env (PENTING: Pakai DB Host dari Docker)
-# Kita force ganti DB_HOST di .env jadi host.docker.internal biar gak error koneksi
-if grep -q "DB_HOST=" .env; then
-  sed -i "s/^DB_HOST=.*/DB_HOST=host.docker.internal/" .env
-else
-  echo "DB_HOST=host.docker.internal" >> .env
-fi
+# Install Composer
+COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
-# 3. Generate APP_KEY
-if grep -q "APP_KEY=$" .env || grep -q "APP_KEY=$" .env.example; then
-    echo "🔑 Men-generate APP_KEY..."
-    php artisan key:generate
-fi
+# Setup App
+WORKDIR /app
+COPY . .
 
-# 4. INSTALL OCTANE (SOLUSI ERROR KAMU)
-# Cek apakah Octane sudah ada di composer.json?
-if ! grep -q "laravel/octane" composer.json; then
-    echo "⚡ Laravel Octane belum terinstall. Menginstall Octane..."
-    
-    # Install package via composer
-    composer require laravel/octane spiral/roadrunner-cli --ignore-platform-reqs
-    
-    # Install config octane untuk FrankenPHP
-    php artisan octane:install --server=frankenphp
-    
-    echo "✅ Octane berhasil diinstall!"
-fi
+# Install Vendor
+RUN composer install --no-dev --optimize-autoloader --no-interaction
 
-# --- BAGIAN 2: AUTO SETUP CLOUDFLARE ---
+# PERMISSION PENTING:
+# Kita beri izin write ke folder /app agar entrypoint bisa copy .env & generate key
+RUN chown -R www-data:www-data /app && chmod -R 775 /app
 
-CF_DIR="/etc/cloudflared"
-mkdir -p $CF_DIR
+# Entrypoint
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Cek Login
-if [ ! -f "$CF_DIR/cert.pem" ]; then
-    echo "⚠️  BELUM LOGIN CLOUDFLARE. Cek logs untuk URL Login."
-    cloudflared tunnel login
-    cp /root/.cloudflared/cert.pem $CF_DIR/ 2>/dev/null || true
-fi
-
-# Cek Config Tunnel
-if [ ! -f "$CF_DIR/config.yml" ]; then
-    # ... (Logika tunnel sama seperti sebelumnya) ...
-    echo "⚙️  Setup Tunnel: $TUNNEL_NAME"
-    
-    EXISTING_JSON=$(find /root/.cloudflared -name "*.json" | head -n 1)
-    if [ -z "$EXISTING_JSON" ]; then
-        cloudflared tunnel create $TUNNEL_NAME
-        EXISTING_JSON=$(find /root/.cloudflared -name "*.json" | head -n 1)
-    fi
-    cp "$EXISTING_JSON" "$CF_DIR/"
-    UUID=$(basename "$EXISTING_JSON" .json)
-    
-    cloudflared tunnel route dns $UUID $APP_DOMAIN
-    
-    cat > $CF_DIR/config.yml <<EOF
-tunnel: "$UUID"
-credentials-file: $CF_DIR/$UUID.json
-ingress:
-  - hostname: $APP_DOMAIN
-    service: http://localhost:80
-  - service: http_status:404
-EOF
-fi
-
-# --- BAGIAN 3: STARTUP ---
-
-echo "🚀 Starting Tunnel & Laravel Octane..."
-cloudflared tunnel run --config $CF_DIR/config.yml &
-
-# PENTING: Jalankan via Octane Command, bukan php-server biasa agar config terload
-php artisan octane:start --server=frankenphp --host=0.0.0.0 --port=80
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
