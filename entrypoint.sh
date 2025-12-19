@@ -14,29 +14,25 @@ if [ ! -f ".env" ]; then
 fi
 
 # 2. Force Database Host ke Docker Host
-# Kita hapus settingan lama dan paksa arahkan ke host.docker.internal
 sed -i '/^DB_HOST=/d' .env
 echo "DB_HOST=host.docker.internal" >> .env
 
-# 3. Generate APP_KEY (Jika kosong atau masih default)
+# 3. Generate APP_KEY (FIXED: Added --force)
+# Kita tambah --force agar tidak minta konfirmasi Yes/No di mode production
 if grep -q "APP_KEY=$" .env || grep -q "APP_KEY=$" .env.example; then
     echo "🔑 Generating APP_KEY..."
-    php artisan key:generate
+    php artisan key:generate --force
 fi
 
 # 4. CEK & INSTALL OCTANE (Otomatis)
 if ! grep -q "laravel/octane" composer.json; then
     echo "⚡ Laravel Octane belum terinstall. Menginstall..."
-    composer require laravel/octane spiral/roadrunner-cli --ignore-platform-reqs
+    # Tambah --no-interaction biar composer gak nanya-nanya juga
+    composer require laravel/octane spiral/roadrunner-cli --ignore-platform-reqs --no-interaction
     
     echo "⚡ Setup Octane Config..."
-    php artisan octane:install --server=frankenphp
+    php artisan octane:install --server=frankenphp --force
 fi
-
-# 5. Cache Configuration (Opsional tapi bagus buat Production)
-# php artisan config:cache
-# php artisan route:cache
-# php artisan view:cache
 
 # ==========================================
 # BAGIAN 2: CLOUDFLARE SETUP
@@ -64,13 +60,11 @@ fi
 cp "$EXISTING_JSON" "$CF_DIR/"
 UUID=$(basename "$EXISTING_JSON" .json)
 
-# 3. FORCE UPDATE CONFIG (Agar Port Selalu Benar)
+# 3. FORCE UPDATE CONFIG
 echo "📝 Updating Cloudflare Config (Target: localhost:8000)..."
 
-# Pastikan DNS routing benar
 cloudflared tunnel route dns $UUID $APP_DOMAIN
 
-# Tulis ulang config.yml
 cat > $CF_DIR/config.yml <<EOF
 tunnel: "$UUID"
 credentials-file: $CF_DIR/$UUID.json
@@ -88,11 +82,6 @@ echo "🚀 Menyalakan Cloudflare Tunnel..."
 cloudflared tunnel run &
 
 echo "🚀 Menyalakan Laravel Octane (Production Mode)..."
-
-# PENJELASAN TUNING 1GB RAM:
-# --workers=2       : Sesuai jumlah vCPU server kamu.
-# --max-requests=500: PENTING! Restart worker tiap 500 request untuk buang sampah memori (Memory Leak Protection).
-# --port=8000       : Sesuai config cloudflare diatas.
 
 php artisan octane:start --server=frankenphp \
     --host=0.0.0.0 \
