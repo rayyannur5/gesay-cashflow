@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "--- 🚀 STARTING SETUP ---"
+echo "--- 🚀 STARTING PRODUCTION SETUP ---"
 
 # ==========================================
 # BAGIAN 1: LARAVEL SETUP
@@ -13,14 +13,12 @@ if [ ! -f ".env" ]; then
     cp .env.example .env
 fi
 
-# 2. Force Database Host ke Docker Host (PENTING!)
-# Kita hapus baris DB_HOST lama dan ganti baru agar pasti connect
-if grep -q "DB_HOST=" .env; then
-    sed -i '/^DB_HOST=/d' .env
-fi
+# 2. Force Database Host ke Docker Host
+# Kita hapus settingan lama dan paksa arahkan ke host.docker.internal
+sed -i '/^DB_HOST=/d' .env
 echo "DB_HOST=host.docker.internal" >> .env
 
-# 3. Generate APP_KEY (Jika kosong)
+# 3. Generate APP_KEY (Jika kosong atau masih default)
 if grep -q "APP_KEY=$" .env || grep -q "APP_KEY=$" .env.example; then
     echo "🔑 Generating APP_KEY..."
     php artisan key:generate
@@ -28,12 +26,17 @@ fi
 
 # 4. CEK & INSTALL OCTANE (Otomatis)
 if ! grep -q "laravel/octane" composer.json; then
-    echo "⚡ Laravel Octane belum ada. Menginstall..."
+    echo "⚡ Laravel Octane belum terinstall. Menginstall..."
     composer require laravel/octane spiral/roadrunner-cli --ignore-platform-reqs
     
     echo "⚡ Setup Octane Config..."
     php artisan octane:install --server=frankenphp
 fi
+
+# 5. Cache Configuration (Opsional tapi bagus buat Production)
+# php artisan config:cache
+# php artisan route:cache
+# php artisan view:cache
 
 # ==========================================
 # BAGIAN 2: CLOUDFLARE SETUP
@@ -42,32 +45,33 @@ fi
 CF_DIR="/etc/cloudflared"
 mkdir -p $CF_DIR
 
-# 1. Cek Login
+# 1. Cek Login & Copy Cert
 if [ ! -f "$CF_DIR/cert.pem" ]; then
     echo "⚠️  BELUM LOGIN CLOUDFLARE. Cek logs untuk URL Login."
     cloudflared tunnel login
-    # Copy cert ke lokasi default config
     cp /root/.cloudflared/cert.pem $CF_DIR/ 2>/dev/null || true
 fi
 
-# 2. Setup Tunnel & Config
-if [ ! -f "$CF_DIR/config.yml" ]; then
-    echo "⚙️  Setup Tunnel: $TUNNEL_NAME"
-    
+# 2. Pastikan Tunnel Ada
+EXISTING_JSON=$(find /root/.cloudflared -name "*.json" | head -n 1)
+if [ -z "$EXISTING_JSON" ]; then
+    echo "⚙️  Membuat Tunnel Baru: $TUNNEL_NAME"
+    cloudflared tunnel create $TUNNEL_NAME
     EXISTING_JSON=$(find /root/.cloudflared -name "*.json" | head -n 1)
-    if [ -z "$EXISTING_JSON" ]; then
-        cloudflared tunnel create $TUNNEL_NAME
-        EXISTING_JSON=$(find /root/.cloudflared -name "*.json" | head -n 1)
-    fi
-    cp "$EXISTING_JSON" "$CF_DIR/"
-    UUID=$(basename "$EXISTING_JSON" .json)
-    
-    echo "🔗 Routing DNS..."
-    cloudflared tunnel route dns $UUID $APP_DOMAIN
-    
-    echo "📝 Writing Config..."
-    # PERBAIKAN: Ingres ke localhost:8000 (Port Octane)
-    cat > $CF_DIR/config.yml <<EOF
+fi
+
+# Copy credentials
+cp "$EXISTING_JSON" "$CF_DIR/"
+UUID=$(basename "$EXISTING_JSON" .json)
+
+# 3. FORCE UPDATE CONFIG (Agar Port Selalu Benar)
+echo "📝 Updating Cloudflare Config (Target: localhost:8000)..."
+
+# Pastikan DNS routing benar
+cloudflared tunnel route dns $UUID $APP_DOMAIN
+
+# Tulis ulang config.yml
+cat > $CF_DIR/config.yml <<EOF
 tunnel: "$UUID"
 credentials-file: $CF_DIR/$UUID.json
 ingress:
@@ -75,17 +79,24 @@ ingress:
     service: http://localhost:8000
   - service: http_status:404
 EOF
-fi
 
 # ==========================================
-# BAGIAN 3: STARTUP
+# BAGIAN 3: STARTUP (PRODUCTION TUNING)
 # ==========================================
 
 echo "🚀 Menyalakan Cloudflare Tunnel..."
-# PERBAIKAN: Jalankan tanpa flag --config (Dia otomatis baca /etc/cloudflared/config.yml)
 cloudflared tunnel run &
 
-echo "🚀 Menyalakan Laravel Octane..."
-# PERBAIKAN: Jalankan perintah native Octane, bukan raw frankenphp
-# Kita set port 8000 agar sesuai dengan config cloudflare diatas
-php artisan octane:start --server=frankenphp --host=0.0.0.0 --port=8000
+echo "🚀 Menyalakan Laravel Octane (Production Mode)..."
+
+# PENJELASAN TUNING 1GB RAM:
+# --workers=2       : Sesuai jumlah vCPU server kamu.
+# --max-requests=500: PENTING! Restart worker tiap 500 request untuk buang sampah memori (Memory Leak Protection).
+# --port=8000       : Sesuai config cloudflare diatas.
+
+php artisan octane:start --server=frankenphp \
+    --host=0.0.0.0 \
+    --port=8000 \
+    --workers=2 \
+    --max-requests=500 \
+    --no-interaction
