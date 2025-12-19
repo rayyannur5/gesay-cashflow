@@ -21,7 +21,7 @@ services:
       - APP_URL=https://cashflow.gesay.my.id
       
       - DB_CONNECTION=mysql
-      - DB_HOST=host.docker.internal  <-- INI KUNCINYA
+      - DB_HOST=host.docker.internal
       - DB_PORT=3306
       - DB_DATABASE=cashflow
       - DB_USERNAME=root
